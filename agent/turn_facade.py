@@ -119,14 +119,16 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
-                    result = run_conversation(
-                        self, user_message, system_message, conversation_history, effective_task_id,
-                        stream_callback, persist_user_message,
-                        persist_user_timestamp=persist_user_timestamp,
-                        persist_user_display_kind=persist_user_display_kind,
-                        persist_user_display_metadata=persist_user_display_metadata,
-                        persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
-                    )
+                    from agent.smart_routing_runtime import smart_route_turn
+                    with smart_route_turn(self, user_message):
+                        result = run_conversation(
+                            self, user_message, system_message, conversation_history, effective_task_id,
+                            stream_callback, persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                        )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.
