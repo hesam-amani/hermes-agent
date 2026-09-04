@@ -113,7 +113,7 @@ def _install_router_fallbacks(
     decision: RoutingDecision,
     policy: CostPolicy,
 ) -> tuple[Any, Any, Any]:
-    """Temporarily expose the router's ranked candidates to Hermes' native fallback loop."""
+    """Temporarily expose ranked candidates to Hermes' native fallback loop."""
     old_chain = getattr(agent, "_fallback_chain", None)
     old_index = getattr(agent, "_fallback_index", 0)
     old_unavailable = getattr(agent, "_unavailable_fallback_keys", None)
@@ -160,14 +160,11 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
         yield None
         return
 
-    # Explicitly opt out when a caller/command marks this turn as locked. The
-    # marker is generic so CLI/gateway/ACP can share it later.
     if getattr(agent, "_smart_routing_locked", False):
         yield None
         return
 
-    # Some transports are not chat-completions model runtimes and must retain
-    # their dedicated lifecycle unchanged.
+    # The Codex app-server has its own subprocess lifecycle; do not redirect it.
     if getattr(agent, "api_mode", "") == "codex_app_server":
         yield None
         return
@@ -211,9 +208,9 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
         return
 
     original = _original_runtime(agent)
-    fallback_snapshot = _install_router_fallbacks(agent, decision, policy)
     started = monotonic()
     switched = False
+    fallback_snapshot = None
     try:
         if not (
             str(decision.primary.provider).lower() == str(agent.provider).lower()
@@ -221,6 +218,11 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
         ):
             agent.switch_model(**_runtime_kwargs(decision.primary))
             switched = True
+
+        # Install the ranked fallback chain only AFTER switch_model() has completed.
+        # switch_model() owns fallback-state normalization, so installing before it
+        # could cause the native switch code to filter or rewrite our transient chain.
+        fallback_snapshot = _install_router_fallbacks(agent, decision, policy)
         yield decision
         _ROUTER.observe(
             decision.primary,
@@ -239,7 +241,8 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
         except Exception:
             logger.exception("Smart routing could not restore original runtime")
         finally:
-            _restore_router_fallbacks(agent, fallback_snapshot)
+            if fallback_snapshot is not None:
+                _restore_router_fallbacks(agent, fallback_snapshot)
 
 
 __all__ = ["smart_route_turn"]
