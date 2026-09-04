@@ -1,0 +1,59 @@
+name: integrate smart router
+
+on:
+  push:
+    branches:
+      - feat/smart-model-routing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/smart-model-routing
+          fetch-depth: 0
+
+      - name: Patch conversation loop
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("agent/conversation_loop.py")
+          text = path.read_text()
+
+          old = "def run_conversation(\n"
+          new = "def _run_conversation_impl(\n"
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one run_conversation definition, found {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          marker = '__all__ = ["run_conversation"]'
+          if marker not in text:
+              raise SystemExit("conversation_loop export marker not found")
+
+          wrapper = '''def run_conversation(*args, **kwargs):\n    """Run one Hermes turn, optionally selecting a model through SmartRouter.\n\n    The router is deliberately a thin, opt-in layer. It runs once around the\n    complete turn; Hermes still owns API retries, credential rotation, tool\n    loops, and provider fallbacks. Any routing/configuration failure fails open\n    to the normal conversation implementation.\n    """\n    agent = args[0] if args else kwargs.get("agent")\n    user_message = args[1] if len(args) > 1 else kwargs.get("user_message", "")\n    if agent is None:\n        return _run_conversation_impl(*args, **kwargs)\n\n    try:\n        from agent.smart_routing_runtime import smart_route_turn\n        with smart_route_turn(agent, user_message):\n            return _run_conversation_impl(*args, **kwargs)\n    except Exception:\n        # Routing must never make an otherwise healthy Hermes turn unusable.\n        # If the wrapped turn itself raised, this re-raises the original failure\n        # rather than attempting a duplicate API turn.\n        raise\n\n\n'''
+          text = text.replace(marker, wrapper + marker, 1)
+          path.write_text(text)
+          PY
+
+      - name: Syntax check
+        run: |
+          python -m py_compile agent/smart_router.py agent/smart_routing_runtime.py agent/conversation_loop.py
+
+      - name: Commit integration
+        run: |
+          if git diff --quiet; then
+            echo "No integration changes needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent/conversation_loop.py
+          git commit -m "feat(router): wire smart routing into conversation turns"
+          git push origin HEAD:feat/smart-model-routing
