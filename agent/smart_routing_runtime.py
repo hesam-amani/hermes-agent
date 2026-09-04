@@ -162,6 +162,15 @@ def _restore_router_fallbacks(agent: Any, snapshot: tuple[Any, Any, Any]) -> Non
     agent._unavailable_fallback_keys = old_unavailable
 
 
+def _runtime_differs(agent: Any, original: dict[str, Any]) -> bool:
+    return (
+        getattr(agent, "model", None) != original["new_model"]
+        or str(getattr(agent, "provider", "") or "").lower() != str(original["new_provider"] or "").lower()
+        or getattr(agent, "base_url", None) != original["base_url"]
+        or getattr(agent, "api_mode", None) != original["api_mode"]
+    )
+
+
 @contextmanager
 def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision | None]:
     """Select and temporarily activate a route for one user turn.
@@ -228,7 +237,6 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
 
     original = _original_runtime(agent)
     started = monotonic()
-    switched = False
     fallback_snapshot = None
     try:
         if not (
@@ -236,7 +244,6 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
             and decision.primary.model == agent.model
         ):
             agent.switch_model(**_runtime_kwargs(decision.primary))
-            switched = True
 
         # Install the ranked fallback chain only AFTER switch_model() has completed.
         # switch_model() owns fallback-state normalization, so installing before it
@@ -253,9 +260,10 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
         raise
     finally:
         try:
-            if switched:
-                # Rebuild the original client through Hermes' canonical switch
-                # path. Never restore a possibly-closed client object.
+            # The native fallback loop may have moved the agent away from both the
+            # router primary and the original model. Automatic routing is turn-scoped,
+            # so restore the original runtime whenever the effective identity changed.
+            if _runtime_differs(agent, original):
                 agent.switch_model(**original)
         except Exception:
             logger.exception("Smart routing could not restore original runtime")
