@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from agent import smart_routing_runtime as runtime
 from agent.smart_router import CostPolicy, ModelCandidate, RoutingDecision, TaskClass
 
@@ -13,6 +11,7 @@ class FakeAgent:
         self.api_key = "key"
         self.base_url = "https://demo.invalid/v1"
         self.api_mode = "chat_completions"
+        self.tools = []
         self._fallback_chain = [{"provider": "demo", "model": "old-fallback"}]
         self._fallback_index = 2
         self._unavailable_fallback_keys = {("demo", "old-fallback")}
@@ -27,20 +26,17 @@ class FakeAgent:
         self.api_mode = kwargs.get("api_mode", "")
 
 
-def _decision():
-    primary = ModelCandidate("demo", "new", free=True, quality=1.0)
+def _decision(primary_model="new"):
+    primary = ModelCandidate("demo", primary_model, free=True, quality=1.0)
     fallback = ModelCandidate("demo", "backup", free=True, quality=0.9)
-    return RoutingDecision(TaskClass.GENERAL, primary, (fallback,), {"demo/new": 1.0})
+    return RoutingDecision(TaskClass.GENERAL, primary, (fallback,), {f"demo/{primary_model}": 1.0})
 
 
-def test_smart_route_turn_activates_and_restores(monkeypatch):
-    agent = FakeAgent()
-    decision = _decision()
-
+def _configure(monkeypatch, decision):
     monkeypatch.setattr(runtime, "_config", lambda: {
         "enabled": True,
         "providers": ["demo"],
-        "free_models": ["demo/new", "demo/backup"],
+        "free_models": ["demo/new", "demo/backup", "demo/old"],
         "cost_policy": "free_only",
     })
     monkeypatch.setattr(runtime, "discover_candidates", lambda *args, **kwargs: list(decision.chain))
@@ -53,9 +49,14 @@ def test_smart_route_turn_activates_and_restores(monkeypatch):
         "api_mode": "chat_completions",
     })
 
+
+def test_smart_route_turn_activates_and_restores(monkeypatch):
+    agent = FakeAgent()
+    decision = _decision()
+    _configure(monkeypatch, decision)
+
     with runtime.smart_route_turn(agent, "hello") as selected:
         assert selected is decision
-        assert agent.provider == "demo"
         assert agent.model == "new"
         assert agent._fallback_chain == [{"provider": "demo", "model": "backup"}]
         assert agent._fallback_index == 0
@@ -72,27 +73,31 @@ def test_free_only_does_not_restore_paid_fallbacks(monkeypatch):
     agent = FakeAgent()
     agent._fallback_chain = [{"provider": "paid", "model": "expensive"}]
     decision = _decision()
-
-    monkeypatch.setattr(runtime, "_config", lambda: {
-        "enabled": True,
-        "providers": ["demo"],
-        "free_models": ["demo/new", "demo/backup"],
-        "cost_policy": CostPolicy.FREE_ONLY.value,
-    })
-    monkeypatch.setattr(runtime, "discover_candidates", lambda *args, **kwargs: list(decision.chain))
-    monkeypatch.setattr(runtime._ROUTER, "route", lambda request, candidates: decision)
-    monkeypatch.setattr(runtime, "_runtime_kwargs", lambda candidate: {
-        "new_model": candidate.model,
-        "new_provider": candidate.provider,
-        "api_key": "key",
-        "base_url": "https://demo.invalid/v1",
-        "api_mode": "chat_completions",
-    })
+    _configure(monkeypatch, decision)
 
     with runtime.smart_route_turn(agent, "hello"):
         assert agent._fallback_chain == [{"provider": "demo", "model": "backup"}]
 
     assert agent._fallback_chain == [{"provider": "paid", "model": "expensive"}]
+
+
+def test_same_primary_is_restored_if_native_fallback_changes_runtime(monkeypatch):
+    agent = FakeAgent()
+    decision = _decision(primary_model="old")
+    _configure(monkeypatch, decision)
+
+    with runtime.smart_route_turn(agent, "hello"):
+        # Simulate Hermes' native fallback activating during the turn. The router
+        # did not need to switch the primary, but the automatic route is still
+        # turn-scoped and must restore the original model.
+        agent.model = "backup"
+        agent.provider = "demo"
+        agent.base_url = "https://backup.invalid/v1"
+        agent.api_mode = "chat_completions"
+
+    assert agent.model == "old"
+    assert agent.base_url == "https://demo.invalid/v1"
+    assert agent.switches[-1]["new_model"] == "old"
 
 
 def test_disabled_routing_is_noop(monkeypatch):
