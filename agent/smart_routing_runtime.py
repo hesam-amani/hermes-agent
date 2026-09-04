@@ -65,6 +65,20 @@ def _prompt_text(user_message: Any) -> str:
     return str(user_message or "")
 
 
+def _is_multimodal_message(user_message: Any) -> bool:
+    if isinstance(user_message, dict):
+        content = user_message.get("content")
+    else:
+        content = user_message
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("type") or "").lower() in {"image", "image_url", "input_image"}
+        for item in content
+    )
+
+
 def _requirements(prompt: str) -> tuple[bool, bool, bool]:
     text = prompt.lower()
     tools = any(x in text for x in (
@@ -188,6 +202,11 @@ def smart_route_turn(agent: Any, user_message: Any) -> Iterator[RoutingDecision 
             force_refresh=bool(cfg.get("force_refresh", False)),
         )
         requires_tools, requires_vision, requires_reasoning = _requirements(prompt)
+        # Hermes is an agent, so if tools are actually registered, the selected
+        # model must advertise tool calling even when the user's wording does not
+        # explicitly mention a tool. Multimodal payloads likewise require vision.
+        requires_tools = requires_tools or bool(getattr(agent, "tools", None))
+        requires_vision = requires_vision or _is_multimodal_message(user_message)
         policy_name = str(cfg.get("cost_policy", CostPolicy.FREE_ONLY.value)).lower()
         try:
             policy = CostPolicy(policy_name)
