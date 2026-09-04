@@ -94,7 +94,13 @@ class SmartRouter:
     def __init__(self) -> None:
         self._health: dict[tuple[str, str], _Health] = {}
 
-    def observe(self, candidate: ModelCandidate, *, success: bool, latency_seconds: float | None = None) -> None:
+    def observe(
+        self,
+        candidate: ModelCandidate,
+        *,
+        success: bool,
+        latency_seconds: float | None = None,
+    ) -> None:
         health = self._health.setdefault((candidate.provider, candidate.model), _Health())
         if success:
             health.successes += 1
@@ -109,10 +115,18 @@ class SmartRouter:
             "code", "python", "typescript", "javascript", "bug", "compile", "function", "api",
             "pytest", "git", "refactor", "stack trace", "traceback", "repository", "repo",
         ))
-        research = any(x in text for x in ("research", "sources", "cite", "compare", "investigate", "latest", "paper"))
-        vision = any(x in text for x in ("image", "photo", "screenshot", "picture", "vision"))
-        long_context = any(x in text for x in ("long document", "entire repository", "whole codebase", "large context", "all files"))
-        reasoning = any(x in text for x in ("prove", "derive", "analyze", "reason", "why", "solve", "calculate"))
+        research = any(x in text for x in (
+            "research", "sources", "cite", "compare", "investigate", "latest", "paper",
+        ))
+        vision = any(x in text for x in (
+            "image", "photo", "screenshot", "picture", "vision",
+        ))
+        long_context = any(x in text for x in (
+            "long document", "entire repository", "whole codebase", "large context", "all files",
+        ))
+        reasoning = any(x in text for x in (
+            "prove", "derive", "analyze", "reason", "why", "solve", "calculate",
+        ))
         if vision:
             return TaskClass.VISION
         if coding:
@@ -127,7 +141,11 @@ class SmartRouter:
             return TaskClass.CASUAL
         return TaskClass.GENERAL
 
-    def filter_candidates(self, candidates: Iterable[ModelCandidate], request: RoutingRequest) -> list[ModelCandidate]:
+    def filter_candidates(
+        self,
+        candidates: Iterable[ModelCandidate],
+        request: RoutingRequest,
+    ) -> list[ModelCandidate]:
         result: list[ModelCandidate] = []
         for candidate in candidates:
             if request.cost_policy is CostPolicy.FREE_ONLY and not candidate.free:
@@ -138,7 +156,9 @@ class SmartRouter:
                 continue
             if request.requires_reasoning and not candidate.supports_reasoning:
                 continue
-            if request.min_context_length is not None and (candidate.context_length or 0) < request.min_context_length:
+            if request.min_context_length is not None and (
+                candidate.context_length or 0
+            ) < request.min_context_length:
                 continue
             result.append(candidate)
         return result
@@ -158,15 +178,48 @@ class SmartRouter:
         }[task]
         return 0.40 * task_fit + 0.25 * candidate.quality + 0.20 * reliability + 0.15 * latency
 
-    def route(self, request: RoutingRequest, candidates: Iterable[ModelCandidate]) -> RoutingDecision:
+    def route(
+        self,
+        request: RoutingRequest,
+        candidates: Iterable[ModelCandidate],
+    ) -> RoutingDecision:
         task = request.task_class or self.classify(request.prompt)
         filtered = self.filter_candidates(candidates, request)
         if not filtered:
             raise LookupError("No model satisfies the smart-routing policy and capabilities")
-        ranked = sorted(filtered, key=lambda c: self.score(c, task), reverse=True)
-        return RoutingDecision(task, ranked[0], tuple(ranked[1:]), {
-            f"{c.provider}/{c.model}": self.score(c, task) for c in ranked
-        })
+
+        ranked = sorted(
+            filtered,
+            key=lambda c: (
+                self.score(c, task),
+                1 if c.free else 0,
+                c.provider.lower(),
+                c.model.lower(),
+            ),
+            reverse=True,
+        )
+
+        # FREE_PREFERRED keeps every eligible model available but gives explicitly
+        # entitled free models a meaningful, deterministic advantage. FREE_ONLY was
+        # already filtered above; ANY intentionally makes no cost preference.
+        if request.cost_policy is CostPolicy.FREE_PREFERRED:
+            ranked = sorted(
+                ranked,
+                key=lambda c: (
+                    self.score(c, task) + (0.12 if c.free else 0.0),
+                    1 if c.free else 0,
+                    c.provider.lower(),
+                    c.model.lower(),
+                ),
+                reverse=True,
+            )
+
+        return RoutingDecision(
+            task,
+            ranked[0],
+            tuple(ranked[1:]),
+            {f"{c.provider}/{c.model}": self.score(c, task) for c in ranked},
+        )
 
     def discover_models(self, provider: str, *, force_refresh: bool = False) -> list[str]:
         from hermes_cli.models import provider_model_ids
@@ -174,16 +227,27 @@ class SmartRouter:
 
 
 def normalize_free_models(value: Any) -> set[tuple[str, str]]:
-    """Parse explicit free entitlements from config; never infer free from price."""
+    """Parse explicit free entitlements from config; never infer free from price.
+
+    Both ``provider/model`` strings and provider-local model IDs are accepted in
+    mappings. A provider prefix is stripped when it matches the mapping key, so
+    ``nvidia: [nvidia/foo]`` and ``nvidia: [foo]`` mean the same model.
+    """
     result: set[tuple[str, str]] = set()
     if isinstance(value, Mapping):
         for provider, models in value.items():
+            provider_name = str(provider).strip().lower()
             if isinstance(models, str):
                 models = [models]
-            if isinstance(models, Iterable):
+            if isinstance(models, Iterable) and not isinstance(models, (bytes, str)):
                 for model in models:
-                    if str(model).strip():
-                        result.add((str(provider).strip().lower(), str(model).strip().lower()))
+                    model_name = str(model).strip()
+                    if not model_name or not provider_name:
+                        continue
+                    prefix = provider_name + "/"
+                    if model_name.lower().startswith(prefix):
+                        model_name = model_name[len(prefix):]
+                    result.add((provider_name, model_name.lower()))
     elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
         for item in value:
             text = str(item).strip()
@@ -194,37 +258,110 @@ def normalize_free_models(value: Any) -> set[tuple[str, str]]:
     return result
 
 
-def candidate_from_metadata(provider: str, model: str, metadata: Any, free_models: set[tuple[str, str]]) -> ModelCandidate:
-    def value(name: str, default: Any = None) -> Any:
-        if isinstance(metadata, Mapping):
-            return metadata.get(name, default)
-        return getattr(metadata, name, default)
-    context = value("context_window") or 0
+def _metadata_value(metadata: Any, name: str, default: Any = None) -> Any:
+    if isinstance(metadata, Mapping):
+        return metadata.get(name, default)
+    return getattr(metadata, name, default)
+
+
+def _metadata_bool(metadata: Any, method_name: str, field_name: str, default: bool = False) -> bool:
+    method = getattr(metadata, method_name, None)
+    if callable(method):
+        try:
+            return bool(method())
+        except Exception:
+            pass
+    return bool(_metadata_value(metadata, field_name, default))
+
+
+def _clamp01(value: Any, default: float = 0.5) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_task_scores(provider: str, model: str, metadata: Any) -> tuple[float, float, float, float]:
+    """Derive conservative task priors when models.dev has no quality taxonomy.
+
+    These are priors, not claims of benchmark superiority. Explicit metadata fields
+    still win when present.
+    """
+    text = f"{provider} {model} {_metadata_value(metadata, 'family', '')}".lower()
+    coding = 0.65 if any(x in text for x in ("coder", "code", "coding", "devstral", "qwen")) else 0.5
+    research = 0.60 if any(x in text for x in ("research", "perplexity", "search")) else 0.5
+    quality = 0.55 if any(x in text for x in ("pro", "ultra", "opus", "sonnet", "reasoning", "think")) else 0.5
+    if any(x in text for x in ("mini", "nano", "flash", "lite", "small")):
+        quality = min(quality, 0.52)
+    return quality, coding, research, 0.5
+
+
+def candidate_from_metadata(
+    provider: str,
+    model: str,
+    metadata: Any,
+    free_models: set[tuple[str, str]],
+) -> ModelCandidate:
+    context = _metadata_value(metadata, "context_window") or 0
     try:
         context = int(context)
     except (TypeError, ValueError):
         context = 0
-    key = (provider.strip().lower(), model.strip().lower())
+
+    provider_name = provider.strip().lower()
+    model_name = model.strip()
+    key = (provider_name, model_name.lower())
+    quality, coding, research, latency = _infer_task_scores(provider_name, model_name, metadata)
+
+    explicit_quality = _metadata_value(metadata, "quality", None)
+    explicit_coding = _metadata_value(metadata, "coding", None)
+    explicit_research = _metadata_value(metadata, "research", None)
+    if explicit_quality is not None:
+        quality = _clamp01(explicit_quality, quality)
+    if explicit_coding is not None:
+        coding = _clamp01(explicit_coding, coding)
+    if explicit_research is not None:
+        research = _clamp01(explicit_research, research)
+
+    modalities = _metadata_value(metadata, "input_modalities", ()) or ()
+    try:
+        modalities = tuple(str(x).lower() for x in modalities)
+    except TypeError:
+        modalities = ()
+
     return ModelCandidate(
-        provider=provider, model=model, free=key in free_models,
+        provider=provider,
+        model=model,
+        free=key in free_models,
         context_length=context or None,
-        supports_tools=bool(value("tool_call", False)),
-        supports_vision=bool(value("attachment", False) or "image" in tuple(value("input_modalities", ()) or ())),
-        supports_reasoning=bool(value("reasoning", False)),
-        quality=float(value("quality", 0.5) or 0.5),
-        coding=float(value("coding", 0.5) or 0.5),
-        research=float(value("research", 0.5) or 0.5),
+        supports_tools=_metadata_bool(metadata, "supports_tools", "tool_call", False),
+        supports_vision=(
+            _metadata_bool(metadata, "supports_vision", "attachment", False)
+            or any("image" in item for item in modalities)
+        ),
+        supports_reasoning=_metadata_bool(metadata, "supports_reasoning", "reasoning", False),
+        quality=quality,
+        coding=coding,
+        research=research,
+        latency_score=latency,
         extra={
-            "family": value("family", ""),
-            "status": value("status", ""),
-            "cost_input": value("cost_input", 0.0),
-            "cost_output": value("cost_output", 0.0),
+            "family": _metadata_value(metadata, "family", ""),
+            "status": _metadata_value(metadata, "status", ""),
+            "cost_input": _metadata_value(metadata, "cost_input", 0.0),
+            "cost_output": _metadata_value(metadata, "cost_output", 0.0),
         },
     )
 
 
-def discover_candidates(router: SmartRouter, providers: Iterable[str], free_models: set[tuple[str, str]], *, force_refresh: bool = False) -> list[ModelCandidate]:
+def discover_candidates(
+    router: SmartRouter,
+    providers: Iterable[str],
+    free_models: set[tuple[str, str]],
+    *,
+    force_refresh: bool = False,
+) -> list[ModelCandidate]:
     from agent.models_dev import get_model_info
+
     candidates: list[ModelCandidate] = []
     for provider in providers:
         try:
@@ -241,6 +378,13 @@ def discover_candidates(router: SmartRouter, providers: Iterable[str], free_mode
 
 
 __all__ = [
-    "CostPolicy", "ModelCandidate", "RoutingDecision", "RoutingRequest", "SmartRouter", "TaskClass",
-    "candidate_from_metadata", "discover_candidates", "normalize_free_models",
+    "CostPolicy",
+    "ModelCandidate",
+    "RoutingDecision",
+    "RoutingRequest",
+    "SmartRouter",
+    "TaskClass",
+    "candidate_from_metadata",
+    "discover_candidates",
+    "normalize_free_models",
 ]
