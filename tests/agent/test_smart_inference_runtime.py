@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing_extensions import runtime
 
 import pytest
 
@@ -34,17 +35,24 @@ def runtime_stubs(monkeypatch):
         agent.context_compressor.model = agent.model
         agent.context_compressor.context_length = context_length
 
-    def finish(agent, provider, old_norm, new_norm):
-        calls.append(("finish", provider))
-        agent._fallback_chain = [{"provider": provider, "model": agent.model}]
-        agent.request_overrides = {"extra_body": {"route": provider}}
+    def apply_request_overrides(agent, provider):
+        calls.append(("overrides", provider))
+        agent.request_overrides = {
+            "extra_body": {
+                "route": provider
+            }
+        }
 
     monkeypatch.setattr(runtime, "_snapshot_switch_state", snapshot)
     monkeypatch.setattr(runtime, "_resolve_switch_destination", resolve_destination)
     monkeypatch.setattr(runtime, "_swap_switch_runtime", swap)
     monkeypatch.setattr(runtime, "_resolve_switch_context_length", resolve_context)
     monkeypatch.setattr(runtime, "_update_switch_compressor", update_compressor)
-    monkeypatch.setattr(runtime, "_finish_switch", finish)
+    monkeypatch.setattr(
+        runtime,
+        "_apply_switched_provider_request_overrides",
+        apply_request_overrides,
+    )
     return calls
 
 
