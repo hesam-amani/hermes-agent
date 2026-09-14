@@ -1,140 +1,275 @@
-"""Small Hermes-facing bridge for per-turn Smart Inference routing.
+"""Hermes integration bridge for Smart Inference.
 
-This module owns no transport logic. It only turns Hermes' already-configured
-primary/fallback routes into Smart Inference candidates and returns a decision.
-Runtime activation is handled separately by ``smart_inference_runtime``.
+This module is intentionally thin.
+
+Smart Inference decides which available model is best for the current turn.
+Hermes remains responsible for all runtime/provider behavior.
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import suppress
+from contextlib import nullcontext
 from typing import Any
+
+from smart_inference.adapter import ( # pyright: ignore[reportMissingImports]
+    candidate_from_metadata,
+    metadata_is_free,
+)
+from smart_inference.router import ( # pyright: ignore[reportMissingImports]
+    CostPolicy,
+    InferenceRequest,
+    choose,
+)
+
+from agent import models_dev
+
+from .smart_inference_runtime import temporary_model_runtime
+
 
 logger = logging.getLogger(__name__)
 
 
-def _configured_routes(agent: Any) -> list[tuple[str, str]]:
-    """Return Hermes routes already present in the live runtime, deduplicated."""
-    routes: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def add(provider: Any, model: Any) -> None:
-        provider = str(provider or "").strip()
-        model = str(model or "").strip()
-        if not provider or not model:
-            return
-        key = (provider.lower(), model.lower())
-        if key not in seen:
-            seen.add(key)
-            routes.append((provider, model))
-
-    add(getattr(agent, "provider", ""), getattr(agent, "model", ""))
-    for entry in getattr(agent, "_fallback_chain", []) or []:
-        if isinstance(entry, dict):
-            add(entry.get("provider"), entry.get("model"))
-
-    fallback = getattr(agent, "_fallback_model", None)
-    if isinstance(fallback, dict):
-        add(fallback.get("provider"), fallback.get("model"))
-
-    return routes
+_POLICY_MAP = {
+    "free_only": CostPolicy.FREE_ONLY,
+    "free_preferred": CostPolicy.FREE_PREFERRED,
+    "any": CostPolicy.ANY,
+}
 
 
-def _is_free(metadata: Any) -> bool:
-    """Infer zero-cost status only from explicit Hermes metadata."""
-    for input_name, output_name in (
-        ("input_cost", "output_cost"),
-        ("input_price", "output_price"),
-    ):
-        try:
-            input_cost = getattr(metadata, input_name, None)
-            output_cost = getattr(metadata, output_name, None)
-            if input_cost is not None and output_cost is not None:
-                return float(input_cost) == 0.0 and float(output_cost) == 0.0
-        except (TypeError, ValueError):
-            continue
-    return False
-
-
-def discover_candidates(agent: Any) -> list[Any]:
-    """Build Smart Inference candidates from Hermes-known routes only."""
+def _get_metadata(
+    provider: str,
+    model: str,
+    metadata_source: Any | None = None,
+) -> Any | None:
     try:
-        from smart_inference import candidate_from_metadata
-    except ImportError:
-        logger.debug("Smart Inference package is not installed")
-        return []
-
-    candidates = []
-    for provider, model in _configured_routes(agent):
-        try:
-            metadata = agent.models_dev.get_model_info(provider, model, allow_network=False)
-            if metadata is None:
-                continue
-            candidates.append(
-                candidate_from_metadata(
-                    provider,
-                    model,
-                    metadata,
-                    free=_is_free(metadata),
-                )
-            )
-        except Exception:
-            logger.debug("Could not inspect Smart Inference route %s/%s", provider, model, exc_info=True)
-    return candidates
-
-
-def choose_for_turn(agent: Any, prompt: str, *, cost_policy: str = "free_preferred") -> Any:
-    """Return a decision for a turn, or ``None`` when routing should fail open."""
-    try:
-        from smart_inference import CostPolicy, InferenceRequest, choose
-
-        policy = CostPolicy(cost_policy)
-        candidates = discover_candidates(agent)
-        if not candidates:
-            return None
-        return choose(InferenceRequest(prompt=prompt, cost_policy=policy), candidates)
+        source = metadata_source or models_dev
+        return source.get_model_info(
+            provider,
+            model,
+            allow_network=False,
+        )
     except Exception:
-        logger.debug("Smart Inference decision failed; keeping Hermes primary", exc_info=True)
+        logger.debug(
+            "Smart Inference could not obtain metadata for %s/%s",
+            provider,
+            model,
+            exc_info=True,
+        )
         return None
 
 
-def route_turn(agent: Any, prompt: str, *, cost_policy: str = "free_preferred"):
-    """Context manager for one automatic route; explicit runtime remains authoritative.
+def _candidate(
+    provider: str,
+    model: str,
+    metadata_source: Any | None = None,
+) -> Any | None:
+    metadata = _get_metadata(
+        provider,
+        model,
+        metadata_source,
+    )
 
-    The caller must opt in by setting ``agent._smart_inference_enabled``. A turn that
-    already has an explicit model selection is never overridden.
+    if metadata is None:
+        return None
+
+    return candidate_from_metadata(
+        provider,
+        model,
+        metadata,
+        free=metadata_is_free(metadata),
+    )
+
+
+def discover_candidates(agent: Any) -> list[Any]:
+    """Discover only models Hermes already knows how to route to."""
+
+    routes: list[tuple[str, str]] = []
+
+    provider = getattr(agent, "provider", None)
+    model = getattr(agent, "model", None)
+    metadata_source = getattr(agent, "models_dev", None)
+
+    if provider and model:
+        routes.append((str(provider), str(model)))
+
+    fallback_chain = getattr(agent, "_fallback_chain", None)
+
+    if fallback_chain:
+        for item in fallback_chain:
+            fallback_provider: str | None = None
+            fallback_model: str | None = None
+
+            if isinstance(item, dict):
+                fallback_provider = item.get("provider")
+                fallback_model = item.get("model")
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                fallback_provider = item[0]
+                fallback_model = item[1]
+            elif isinstance(item, str):
+                # A plain model string can use the current provider.
+                fallback_provider = provider
+                fallback_model = item
+
+            if fallback_provider and fallback_model:
+                routes.append(
+                    (
+                        str(fallback_provider),
+                        str(fallback_model),
+                    )
+                )
+
+    fallback_model = getattr(agent, "_fallback_model", None)
+
+    if isinstance(fallback_model, dict):
+        fallback_provider = fallback_model.get("provider")
+        fallback_model_id = fallback_model.get("model")
+
+        if fallback_provider and fallback_model_id:
+            routes.append(
+                (
+                    str(fallback_provider),
+                    str(fallback_model_id),
+                )
+            )
+
+    candidates: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+
+    for route_provider, route_model in routes:
+        key = (route_provider, route_model)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        candidate = _candidate(
+            route_provider,
+            route_model,
+            metadata_source,
+        )
+
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def _policy(agent: Any) -> CostPolicy:
+    value = getattr(
+        agent,
+        "_smart_inference_policy",
+        "free_preferred",
+    )
+
+    if isinstance(value, CostPolicy):
+        return value
+
+    return _POLICY_MAP.get(
+        str(value).lower(),
+        CostPolicy.FREE_PREFERRED,
+    )
+
+
+def choose_for_turn(
+    agent: Any,
+    user_message: str,
+) -> Any | None:
+    """Return a Smart Inference decision for this turn."""
+
+    candidates = discover_candidates(agent)
+
+    if not candidates:
+        return None
+
+    request = InferenceRequest(
+        prompt=user_message,
+        candidates=candidates,
+        cost_policy=_policy(agent),
+    )
+
+    return choose(request)
+
+
+def routing_enabled(agent: Any) -> bool:
+    return bool(
+        getattr(
+            agent,
+            "_smart_inference_enabled",
+            False,
+        )
+    )
+
+
+def explicit_model_selected(agent: Any) -> bool:
+    return bool(
+        getattr(
+            agent,
+            "_smart_inference_explicit",
+            False,
+        )
+    )
+
+
+def route_turn(agent: Any, user_message: str):
+    """Return a context manager for the selected route.
+
+    If Smart Inference should not act, this returns a no-op context manager.
     """
-    from contextlib import nullcontext
 
-    if not getattr(agent, "_smart_inference_enabled", False):
-        return nullcontext()
-    if getattr(agent, "_smart_inference_explicit", False):
-        return nullcontext()
-    if getattr(agent, "api_mode", "") == "codex_app_server":
+    if not routing_enabled(agent):
         return nullcontext()
 
-    decision = choose_for_turn(agent, prompt, cost_policy=cost_policy)
-    if decision is None:
+    if explicit_model_selected(agent):
         return nullcontext()
 
-    current = (str(getattr(agent, "provider", "")), str(getattr(agent, "model", "")))
-    if (decision.primary.provider, decision.primary.model) == current:
+    if getattr(agent, "api_mode", None) == "codex_app_server":
         return nullcontext()
 
-    from agent.smart_inference_runtime import temporary_model_runtime
+    try:
+        decision = choose_for_turn(
+            agent,
+            user_message,
+        )
+    except Exception:
+        logger.exception(
+            "Smart Inference failed; continuing with Hermes' current route"
+        )
+        return nullcontext()
+
+    if decision is None or decision.primary is None:
+        return nullcontext()
+
+    current_provider = str(
+        getattr(agent, "provider", "")
+    )
+    current_model = str(
+        getattr(agent, "model", "")
+    )
+
+    selected_provider = str(
+        decision.primary.ref.provider
+    )
+    selected_model = str(
+        decision.primary.ref.model
+    )
+
+    if (
+        selected_provider == current_provider
+        and selected_model == current_model
+    ):
+        return nullcontext()
 
     logger.info(
-        "Smart Inference: %s -> %s (%s)",
-        f"{current[0]}/{current[1]}",
-        decision.primary.key,
-        decision.rationale,
+        "Smart Inference selected %s/%s for task=%s",
+        selected_provider,
+        selected_model,
+        getattr(decision.task, "value", decision.task),
     )
+
     return temporary_model_runtime(
         agent,
-        model=decision.primary.model,
-        provider=decision.primary.provider,
+        selected_provider,
+        selected_model,
     )
-
-
-__all__ = ["discover_candidates", "choose_for_turn", "route_turn"]

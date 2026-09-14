@@ -1455,6 +1455,8 @@ def _run_conversation_turn(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    from .smart_inference_bridge import route_turn
+
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
         _ctx = build_turn_context(
@@ -1492,78 +1494,105 @@ def _run_conversation_turn(
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
 
-    s = _LoopState(
-        system_message=system_message, moa_config=moa_config,
-        max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
-        **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
+    _smart_inference_runtime = route_turn(
+        agent,
+        user_message,
     )
-    # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
-    # app-server subprocess (see agent/transports/codex_app_server_session.py).
-    if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=s.user_message, original_user_message=s.original_user_message,
-            messages=s.messages, effective_task_id=s.effective_task_id,
-            should_review_memory=s._should_review_memory,
+
+    with _smart_inference_runtime:
+        s = _LoopState(
+            system_message=system_message, moa_config=moa_config,
+            max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
+            **{
+                f.name: getattr(_ctx, f.name.lstrip("_"))
+                for f in fields(_LoopState)
+                if f.name in _CTX_FIELDS
+            },
         )
 
-    while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-        if _run_phase(begin_iteration, agent, s).action == "break":
-            break
-        _run_phase(prepare_iteration, agent, s)
-        _run_phase(assemble_api_request, agent, s)
-        _pg = _run_phase(run_preflight_gate, agent, s)
-        if _pg.action == "return":
-            return _pg.result
-        if _pg.action == "break":
-            break
-        if _pg.action == "continue":
-            continue
-        _run_phase(announce_api_call, agent, s)
-
-        s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
-        s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
-        s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
-
-        early_result = _run_api_retry_loop(agent, s)
-        if early_result is not None:
-            return early_result
-
-        _rs = _run_phase(apply_retry_restarts, agent, s)
-        if _rs.action == "break":
-            break
-        if _rs.action == "continue":
-            continue
-
-        try:
-            _ri = _run_phase(normalize_model_response, agent, s)
-            if _ri.action == "return":
-                return _ri.result
-            if _ri.action == "continue":
-                continue
-            _v = _run_phase(
-                run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
+        # Opt-in runtime: api_mode == codex_app_server hands the whole turn to
+        # the codex app-server subprocess (see agent/transports/codex_app_server_session.py).
+        if agent.api_mode == "codex_app_server":
+            return agent._run_codex_app_server_turn(
+                user_message=s.user_message,
+                original_user_message=s.original_user_message,
+                messages=s.messages,
+                effective_task_id=s.effective_task_id,
+                should_review_memory=s._should_review_memory,
             )
-            if _v.action == "return":
-                return _v.result
-            if _v.action == "break":
+
+        while (
+            (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+            or agent._budget_grace_call
+        ):
+            if _run_phase(begin_iteration, agent, s).action == "break":
                 break
-            if _v.action == "continue":
+
+            _run_phase(prepare_iteration, agent, s)
+            _run_phase(assemble_api_request, agent, s)
+
+            _pg = _run_phase(run_preflight_gate, agent, s)
+            if _pg.action == "return":
+                return _pg.result
+            if _pg.action == "break":
+                break
+            if _pg.action == "continue":
                 continue
-        except Exception as e:
-            if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
+
+            _run_phase(announce_api_call, agent, s)
+
+            s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
+            s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
+            s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
+
+            early_result = _run_api_retry_loop(agent, s)
+            if early_result is not None:
+                return early_result
+
+            _rs = _run_phase(apply_retry_restarts, agent, s)
+            if _rs.action == "break":
                 break
+            if _rs.action == "continue":
+                continue
 
-    # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
-    if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
-        result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
-    return result
+            try:
+                _ri = _run_phase(normalize_model_response, agent, s)
+                if _ri.action == "return":
+                    return _ri.result
+                if _ri.action == "continue":
+                    continue
 
+                _v = _run_phase(
+                    run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
+                )
+                if _v.action == "return":
+                    return _v.result
+                if _v.action == "break":
+                    break
+                if _v.action == "continue":
+                    continue
+            except Exception as e:
+                if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
+                    break
+
+        # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
+        result = finalize_turn(
+            agent,
+            **{
+                name: getattr(s, name)
+                for name in inspect.signature(finalize_turn).parameters
+                if name != "agent"
+            },
+        )
+        if s._compression_timeout_exhausted:
+            # Reuse the gateway's context-recovery contract: transcript stays intact
+            # while future input can move to a clean session (#98722).
+            result.update(
+                error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE,
+                partial=True,
+                compression_exhausted=True,
+            )
+        return result
 
 def run_conversation(
     agent,
