@@ -1,8 +1,8 @@
 """Turn-scoped runtime binding for automatic Smart Inference routing.
 
-Automatic routing is deliberately different from Hermes' durable ``switch_model``
-operation. This module reuses Hermes' destination-resolution/client-building
-primitives, but never rewrites ``_primary_runtime`` or billing state.
+Automatic routing is an execution choice for one turn, not a durable model
+selection. This module reuses Hermes' destination-resolution/client-building
+primitives without calling ``switch_model()`` or ``_finish_switch()``.
 """
 
 from __future__ import annotations
@@ -64,8 +64,6 @@ def _restore(agent: Any, state: dict[str, Any]) -> None:
         try:
             setattr(agent, name, value)
         except Exception:
-            # Restoration must be best-effort for optional/private attributes;
-            # Hermes' existing restore machinery follows the same principle.
             pass
 
     transport_cache = state.get("__transport_cache__", _MISSING)
@@ -100,11 +98,9 @@ def temporary_model_runtime(
 ) -> Iterator[None]:
     """Bind ``agent`` to one model for the lifetime of a user turn.
 
-    The normal Hermes conversation loop remains in charge while this context is
-    active: request assembly, tools, retries, streaming and native fallback all
-    see the selected runtime. On exit the original primary runtime and the
-    transient routing state are restored, including the context-compressor
-    destination.
+    Hermes remains responsible for provider resolution, credentials, client
+    construction, request assembly, tools, retries, streaming and fallback.
+    Every temporary runtime mutation is restored when the context exits.
     """
     from agent import agent_runtime_helpers as runtime
 
@@ -155,11 +151,13 @@ def temporary_model_runtime(
         agent._cached_system_prompt = None
         agent.runtime_capabilities = destination_capabilities
 
-        # This prepares per-destination request overrides/fallback bookkeeping,
-        # but the complete state above is restored when the turn ends. Crucially,
-        # we never call _finish_switch's billing persistence or rebuild
-        # _primary_runtime.
-        runtime._finish_switch(agent, provider, old_norm, new_norm)
+        # Re-derive only destination request overrides. Do not call _finish_switch:
+        # that function intentionally resets/prunes fallback state for a durable
+        # user-driven model switch.
+        try:
+            runtime._apply_switched_provider_request_overrides(agent, provider)
+        except Exception:
+            pass
 
         yield
     finally:
